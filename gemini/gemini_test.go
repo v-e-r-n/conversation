@@ -3,8 +3,8 @@ package gemini_test
 import (
 	"testing"
 
-	"codeberg.org/v-e-r-n/conversation/core"
-	"codeberg.org/v-e-r-n/conversation/gemini"
+	"github.com/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/gemini"
 )
 
 func TestGeminiToRequest(t *testing.T) {

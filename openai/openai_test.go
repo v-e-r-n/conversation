@@ -3,8 +3,8 @@ package openai_test
 import (
 	"testing"
 
-	"codeberg.org/v-e-r-n/conversation/core"
-	"codeberg.org/v-e-r-n/conversation/openai"
+	"github.com/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/openai"
 )
 
 func TestOpenAIToRequest(t *testing.T) {

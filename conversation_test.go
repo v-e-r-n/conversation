@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"codeberg.org/v-e-r-n/conversation"
-	"codeberg.org/v-e-r-n/conversation/anthropic"
-	"codeberg.org/v-e-r-n/conversation/gemini"
-	"codeberg.org/v-e-r-n/conversation/openai"
+	"github.com/v-e-r-n/conversation"
+	"github.com/v-e-r-n/conversation/anthropic"
+	"github.com/v-e-r-n/conversation/gemini"
+	"github.com/v-e-r-n/conversation/openai"
 )
 
 func TestRendererFallbackAndSetMeta(t *testing.T) {

@@ -65,8 +65,8 @@ Parse an incoming OpenAI-compatible payload into the generalized IR. This automa
 import (
 	"encoding/json"
 	"net/http"
-	"codeberg.org/v-e-r-n/conversation"
-	"codeberg.org/v-e-r-n/conversation/openai"
+	"github.com/v-e-r-n/conversation"
+	"github.com/v-e-r-n/conversation/openai"
 )
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +92,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 ### 2. Exporting to OpenAI
 Reconstruct an OpenAI-compatible request payload (re-merging the system prompts back into the messages list):
 ```go
-import "codeberg.org/v-e-r-n/conversation"
+import "github.com/v-e-r-n/conversation"
 
 // Setup export options
 opts := conversation.NewExportOptions()
@@ -104,7 +104,7 @@ openaiReq, err := conversation.ToOpenAI(conv, opts)
 ### 3. Exporting to Anthropic Claude
 Format the conversation IR into a payload suitable for the Anthropic Messages API:
 ```go
-import "codeberg.org/v-e-r-n/conversation"
+import "github.com/v-e-r-n/conversation"
 
 opts := conversation.NewExportOptions()
 opts.Model = "claude-3-5-sonnet-latest"
@@ -115,7 +115,7 @@ anthropicReq, err := conversation.ToAnthropic(conv, opts)
 ### 4. Exporting to Google Gemini
 Format the conversation IR into a payload suitable for the Gemini API:
 ```go
-import "codeberg.org/v-e-r-n/conversation"
+import "github.com/v-e-r-n/conversation"
 
 opts := conversation.NewExportOptions()
 opts.Model = "gemini-2.5-flash"
@@ -130,7 +130,7 @@ geminiReq, err := conversation.ToGemini(conv, opts)
 Since message content is represented by a list of `Part`s, you can register custom renderers to format specific part types (e.g., custom markdown tags, files, or attachments) during translation to upstream payloads:
 
 ```go
-import "codeberg.org/v-e-r-n/conversation"
+import "github.com/v-e-r-n/conversation"
 
 opts := conversation.NewExportOptions()
 

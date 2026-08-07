@@ -1,7 +1,7 @@
 package openai
 
 import (
-	"codeberg.org/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/core"
 	"fmt"
 	"strings"
 )

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"codeberg.org/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/core"
 )
 
 func TestJSONUnmarshalingAndPolymorphicContent(t *testing.T) {

@@ -3,8 +3,8 @@ package anthropic_test
 import (
 	"testing"
 
-	"codeberg.org/v-e-r-n/conversation/anthropic"
-	"codeberg.org/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/anthropic"
+	"github.com/v-e-r-n/conversation/core"
 )
 
 func TestAnthropicToRequest(t *testing.T) {

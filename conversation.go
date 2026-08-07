@@ -3,10 +3,10 @@ package conversation
 import (
 	"fmt"
 
-	"codeberg.org/v-e-r-n/conversation/anthropic"
-	"codeberg.org/v-e-r-n/conversation/core"
-	"codeberg.org/v-e-r-n/conversation/gemini"
-	"codeberg.org/v-e-r-n/conversation/openai"
+	"github.com/v-e-r-n/conversation/anthropic"
+	"github.com/v-e-r-n/conversation/core"
+	"github.com/v-e-r-n/conversation/gemini"
+	"github.com/v-e-r-n/conversation/openai"
 )
 
 // Expose core types to consumer via Go type aliases
