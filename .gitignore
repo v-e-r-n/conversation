@@ -1,0 +1,8 @@
+# Test binaries and coverage reports
+*.test
+coverage.out
+
+# Local editor and workspace configurations
+.idea/
+.vscode/
+.DS_Store
