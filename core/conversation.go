@@ -110,6 +110,22 @@ type Message struct {
 	data  map[string]any
 }
 
+// MetaMap returns the full metadata map for the Message.
+func (m *Message) MetaMap() map[string]any {
+	if m.data == nil {
+		return nil
+	}
+	metaVal, exists := m.data["meta"]
+	if !exists {
+		return nil
+	}
+	meta, ok := metaVal.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return meta
+}
+
 func (m *Message) Import(blob any) error {
 	raw, ok := blob.(map[string]any)
 	if !ok {
