@@ -7,19 +7,23 @@ import (
 )
 
 type OpenAIMessage struct {
-	Role    string         `json:"role"`
-	Content any            `json:"content"` // can be string or []any content parts
-	Name    string         `json:"name,omitempty"`
-	Meta    map[string]any `json:"meta,omitempty"`
+	Role       string          `json:"role"`
+	Content    any             `json:"content"` // can be string or []any content parts or nil
+	Name       string          `json:"name,omitempty"`
+	ToolCalls  []core.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Meta       map[string]any  `json:"meta,omitempty"`
 }
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	MaxTokens   *int            `json:"max_tokens,omitempty"`
-	Stop        []string        `json:"stop,omitempty"`
+	Model       string                `json:"model"`
+	Messages    []OpenAIMessage       `json:"messages"`
+	Tools       []core.ToolDefinition `json:"tools,omitempty"`
+	ToolChoice  any                   `json:"tool_choice,omitempty"`
+	Temperature *float64              `json:"temperature,omitempty"`
+	TopP        *float64              `json:"top_p,omitempty"`
+	MaxTokens   *int                  `json:"max_tokens,omitempty"`
+	Stop        []string              `json:"stop,omitempty"`
 }
 
 // ToRequest translates core.Conversation to OpenAIRequest.
@@ -47,6 +51,9 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIRequest, 
 	for _, msg := range c.Messages {
 		var openAIMsg OpenAIMessage
 		openAIMsg.Role = string(msg.Role)
+		openAIMsg.Name = msg.Name
+		openAIMsg.ToolCalls = msg.ToolCalls
+		openAIMsg.ToolCallID = msg.ToolCallID
 
 		var renderedParts []any
 		var hasRichContent bool
@@ -78,7 +85,13 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIRequest, 
 			}
 		}
 
-		if !hasRichContent && len(renderedParts) == 1 {
+		if len(renderedParts) == 0 {
+			if len(msg.ToolCalls) > 0 {
+				openAIMsg.Content = nil
+			} else {
+				openAIMsg.Content = ""
+			}
+		} else if !hasRichContent && len(renderedParts) == 1 {
 			if textPart, ok := renderedParts[0].(map[string]any); ok {
 				openAIMsg.Content = textPart["text"]
 			}
@@ -92,6 +105,8 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIRequest, 
 	return &OpenAIRequest{
 		Model:       model,
 		Messages:    openAIMsgs,
+		Tools:       c.Tools,
+		ToolChoice:  c.ToolChoice,
 		Temperature: c.Parameters.Temperature,
 		TopP:        c.Parameters.TopP,
 		MaxTokens:   c.Parameters.MaxTokens,
@@ -121,15 +136,22 @@ func FromRequest(req *OpenAIRequest) (*core.Conversation, error) {
 
 		var m core.Message
 		m.Role = core.Role(msg.Role)
+		m.Name = msg.Name
+		m.ToolCalls = msg.ToolCalls
+		m.ToolCallID = msg.ToolCallID
 
-		parts, err := extractCoreParts(msg.Content, msg.Meta)
-		if err != nil {
-			return nil, err
+		if msg.Content != nil {
+			parts, err := extractCoreParts(msg.Content, msg.Meta)
+			if err != nil {
+				return nil, err
+			}
+			m.Parts = parts
 		}
-		m.Parts = parts
 		coreMsgs = append(coreMsgs, m)
 	}
 	c.Messages = coreMsgs
+	c.Tools = req.Tools
+	c.ToolChoice = req.ToolChoice
 
 	c.Parameters.Temperature = req.Temperature
 	c.Parameters.TopP = req.TopP
@@ -148,6 +170,10 @@ func renderPart(content any, meta map[string]any, pType string, renderers map[st
 }
 
 func extractCoreParts(content any, msgMeta map[string]any) ([]core.Part, error) {
+	if content == nil {
+		return nil, nil
+	}
+
 	if s, ok := content.(string); ok {
 		p := core.Part{
 			Type:    "text",

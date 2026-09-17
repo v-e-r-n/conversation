@@ -132,3 +132,104 @@ func TestHelpers(t *testing.T) {
 		t.Errorf("AddAssistantMessage failed")
 	}
 }
+
+func TestToolCallingSupport(t *testing.T) {
+	jsonStr := `{
+		"model": "gpt-4o",
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "get_weather",
+					"description": "Get current temperature",
+					"parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+				}
+			}
+		],
+		"tool_choice": "auto",
+		"messages": [
+			{"role": "user", "content": "What's the weather in Seattle?"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_123",
+						"type": "function",
+						"function": {
+							"name": "get_weather",
+							"arguments": "{\"location\":\"Seattle\"}"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": "call_123",
+				"content": "{\"temp\": 65, \"condition\": \"Rainy\"}"
+			}
+		]
+	}`
+
+	var conv core.Conversation
+	if err := json.Unmarshal([]byte(jsonStr), &conv); err != nil {
+		t.Fatalf("Failed to unmarshal tool calling conversation: %v", err)
+	}
+
+	if len(conv.Tools) != 1 || conv.Tools[0].Function["name"] != "get_weather" {
+		t.Fatalf("Expected 1 tool definition, got %+v", conv.Tools)
+	}
+	if conv.ToolChoice != "auto" {
+		t.Errorf("Expected tool_choice 'auto', got %v", conv.ToolChoice)
+	}
+
+	if len(conv.Messages) != 3 {
+		t.Fatalf("Expected 3 messages, got %d", len(conv.Messages))
+	}
+
+	// Message 1: User
+	if conv.Messages[0].Role != core.RoleUser || len(conv.Messages[0].Parts) != 1 {
+		t.Errorf("Unexpected user message: %+v", conv.Messages[0])
+	}
+
+	// Message 2: Assistant with content: null and tool_calls
+	asst := conv.Messages[1]
+	if asst.Role != core.RoleAssistant {
+		t.Errorf("Expected assistant role, got %s", asst.Role)
+	}
+	if len(asst.Parts) != 0 {
+		t.Errorf("Expected 0 parts for content: null, got %d", len(asst.Parts))
+	}
+	if len(asst.ToolCalls) != 1 {
+		t.Fatalf("Expected 1 tool call, got %d", len(asst.ToolCalls))
+	}
+	if asst.ToolCalls[0].ID != "call_123" || asst.ToolCalls[0].Function.Name != "get_weather" {
+		t.Errorf("Unexpected tool call contents: %+v", asst.ToolCalls[0])
+	}
+
+	// Message 3: Tool response
+	toolMsg := conv.Messages[2]
+	if toolMsg.Role != core.RoleTool {
+		t.Errorf("Expected tool role, got %s", toolMsg.Role)
+	}
+	if toolMsg.ToolCallID != "call_123" {
+		t.Errorf("Expected tool_call_id 'call_123', got %s", toolMsg.ToolCallID)
+	}
+	if len(toolMsg.Parts) != 1 || toolMsg.Parts[0].Content != "{\"temp\": 65, \"condition\": \"Rainy\"}" {
+		t.Errorf("Unexpected tool response content: %+v", toolMsg.Parts)
+	}
+
+	// Round-trip marshal test
+	marshaledBytes, err := json.Marshal(&conv)
+	if err != nil {
+		t.Fatalf("Failed to marshal conversation: %v", err)
+	}
+
+	var roundtrip core.Conversation
+	if err := json.Unmarshal(marshaledBytes, &roundtrip); err != nil {
+		t.Fatalf("Failed to unmarshal roundtrip conversation: %v", err)
+	}
+	if len(roundtrip.Messages[1].ToolCalls) != 1 || roundtrip.Messages[2].ToolCallID != "call_123" {
+		t.Errorf("Roundtrip mismatch: %+v", roundtrip)
+	}
+}

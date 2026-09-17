@@ -1,9 +1,11 @@
 package anthropic
 
 import (
-	"github.com/v-e-r-n/conversation/core"
+	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/v-e-r-n/conversation/core"
 )
 
 type AnthropicMessage struct {
@@ -15,6 +17,8 @@ type AnthropicRequest struct {
 	Model         string             `json:"model"`
 	Messages      []AnthropicMessage `json:"messages"`
 	System        string             `json:"system,omitempty"`
+	Tools         []any              `json:"tools,omitempty"`
+	ToolChoice    any                `json:"tool_choice,omitempty"`
 	MaxTokens     int                `json:"max_tokens"`
 	Temperature   *float64           `json:"temperature,omitempty"`
 	TopP          *float64           `json:"top_p,omitempty"`
@@ -57,30 +61,65 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 		var renderedParts []any
 		var hasRichContent bool
 
-		for _, part := range msg.Parts {
-			rendered, err := renderPart(part.Content, part.Meta, part.Type, opts.Renderers)
-			if err != nil {
-				return nil, err
+		// If role is tool, map to tool_result content part
+		if msg.Role == core.RoleTool {
+			contentStr := ""
+			if len(msg.Parts) > 0 {
+				if s, ok := msg.Parts[0].Content.(string); ok {
+					contentStr = s
+				} else {
+					contentStr = fmt.Sprintf("%v", msg.Parts[0].Content)
+				}
+			}
+			renderedParts = append(renderedParts, map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": msg.ToolCallID,
+				"content":     contentStr,
+			})
+			hasRichContent = true
+		} else {
+			for _, part := range msg.Parts {
+				rendered, err := renderPart(part.Content, part.Meta, part.Type, opts.Renderers)
+				if err != nil {
+					return nil, err
+				}
+
+				switch part.Type {
+				case "text":
+					renderedParts = append(renderedParts, map[string]any{
+						"type": "text",
+						"text": rendered,
+					})
+				case "image":
+					renderedParts = append(renderedParts, map[string]any{
+						"type":   "image",
+						"source": rendered,
+					})
+					hasRichContent = true
+				default:
+					renderedParts = append(renderedParts, map[string]any{
+						"type":    part.Type,
+						part.Type: rendered,
+					})
+					hasRichContent = true
+				}
 			}
 
-			switch part.Type {
-			case "text":
-				renderedParts = append(renderedParts, map[string]any{
-					"type": "text",
-					"text": rendered,
-				})
-			case "image":
-				renderedParts = append(renderedParts, map[string]any{
-					"type":   "image",
-					"source": rendered,
-				})
-				hasRichContent = true
-			default:
-				renderedParts = append(renderedParts, map[string]any{
-					"type":    part.Type,
-					part.Type: rendered,
-				})
-				hasRichContent = true
+			// If assistant message has ToolCalls, map to tool_use blocks
+			if msg.Role == core.RoleAssistant && len(msg.ToolCalls) > 0 {
+				for _, tc := range msg.ToolCalls {
+					var inputMap any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &inputMap); err != nil {
+						inputMap = map[string]any{"raw": tc.Function.Arguments}
+					}
+					renderedParts = append(renderedParts, map[string]any{
+						"type":  "tool_use",
+						"id":    tc.ID,
+						"name":  tc.Function.Name,
+						"input": inputMap,
+					})
+					hasRichContent = true
+				}
 			}
 		}
 
@@ -95,10 +134,23 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 		anthropicMsgs = append(anthropicMsgs, antMsg)
 	}
 
+	var antTools []any
+	for _, td := range c.Tools {
+		fn := td.Function
+		toolMap := map[string]any{
+			"name":         fn["name"],
+			"description":  fn["description"],
+			"input_schema": fn["parameters"],
+		}
+		antTools = append(antTools, toolMap)
+	}
+
 	return &AnthropicRequest{
 		Model:         model,
 		Messages:      anthropicMsgs,
 		System:        systemStr,
+		Tools:         antTools,
+		ToolChoice:    c.ToolChoice,
 		MaxTokens:     maxTokens,
 		Temperature:   c.Parameters.Temperature,
 		TopP:          c.Parameters.TopP,
@@ -122,6 +174,40 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 	for _, msg := range req.Messages {
 		var m core.Message
 		m.Role = core.Role(msg.Role)
+
+		// Check if content contains tool_result or tool_use blocks
+		if arr, ok := msg.Content.([]any); ok {
+			var isToolResult bool
+			for _, item := range arr {
+				if itemMap, ok := item.(map[string]any); ok {
+					if itemMap["type"] == "tool_result" {
+						isToolResult = true
+						m.Role = core.RoleTool
+						if id, ok := itemMap["tool_use_id"].(string); ok {
+							m.ToolCallID = id
+						}
+						if cnt, ok := itemMap["content"].(string); ok {
+							m.Parts = []core.Part{{Type: "text", Content: cnt}}
+						}
+						break
+					} else if itemMap["type"] == "tool_use" {
+						var tc core.ToolCall
+						tc.ID, _ = itemMap["id"].(string)
+						tc.Type = "function"
+						tc.Function.Name, _ = itemMap["name"].(string)
+						if inObj, exists := itemMap["input"]; exists {
+							b, _ := json.Marshal(inObj)
+							tc.Function.Arguments = string(b)
+						}
+						m.ToolCalls = append(m.ToolCalls, tc)
+					}
+				}
+			}
+			if isToolResult {
+				coreMsgs = append(coreMsgs, m)
+				continue
+			}
+		}
 
 		parts, err := extractCoreParts(msg.Content)
 		if err != nil {

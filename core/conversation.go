@@ -103,11 +103,33 @@ func (p *Part) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// ToolFunction represents a function call specification within a tool call.
+type ToolFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// ToolCall represents a tool call invocation emitted by the assistant.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolDefinition represents a declared tool schema provided in a conversation request.
+type ToolDefinition struct {
+	Type     string         `json:"type"`
+	Function map[string]any `json:"function"`
+}
+
 // Message represents a single chat turn.
 type Message struct {
-	Role  Role   `json:"role"`
-	Parts []Part `json:"parts"`
-	data  map[string]any
+	Role       Role           `json:"role"`
+	Parts      []Part         `json:"parts,omitempty"`
+	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Name       string         `json:"name,omitempty"`
+	data       map[string]any
 }
 
 // MetaMap returns the full metadata map for the Message.
@@ -135,9 +157,44 @@ func (m *Message) Import(blob any) error {
 	roleStr, _ := raw["role"].(string)
 	m.Role = Role(roleStr)
 
+	if name, ok := raw["name"].(string); ok {
+		m.Name = name
+	}
+	if toolCallID, ok := raw["tool_call_id"].(string); ok {
+		m.ToolCallID = toolCallID
+	}
+
+	if tcBlob, exists := raw["tool_calls"]; exists && tcBlob != nil {
+		if tcArr, ok := tcBlob.([]any); ok {
+			var toolCalls []ToolCall
+			for _, item := range tcArr {
+				if itemMap, ok := item.(map[string]any); ok {
+					var tc ToolCall
+					tc.ID, _ = itemMap["id"].(string)
+					tc.Type, _ = itemMap["type"].(string)
+					if tc.Type == "" {
+						tc.Type = "function"
+					}
+					if fnMap, ok := itemMap["function"].(map[string]any); ok {
+						tc.Function.Name, _ = fnMap["name"].(string)
+						if argsStr, ok := fnMap["arguments"].(string); ok {
+							tc.Function.Arguments = argsStr
+						} else if argsObj, ok := fnMap["arguments"]; ok {
+							b, _ := json.Marshal(argsObj)
+							tc.Function.Arguments = string(b)
+						}
+					}
+					toolCalls = append(toolCalls, tc)
+				}
+			}
+			m.ToolCalls = toolCalls
+		}
+	}
+
 	content, exists := raw["content"]
-	if !exists {
-		return fmt.Errorf("message has no content field")
+	if !exists || content == nil {
+		m.Parts = nil
+		return nil
 	}
 
 	parts, err := extractContentParts(content)
@@ -153,16 +210,48 @@ func (m *Message) Export() (map[string]any, error) {
 		m.data = make(map[string]any)
 	}
 	m.data["role"] = string(m.Role)
-
-	var rawParts []any
-	for i := range m.Parts {
-		exportedPart, err := m.Parts[i].Export()
-		if err != nil {
-			return nil, err
-		}
-		rawParts = append(rawParts, exportedPart)
+	if m.Name != "" {
+		m.data["name"] = m.Name
 	}
-	m.data["content"] = rawParts
+	if m.ToolCallID != "" {
+		m.data["tool_call_id"] = m.ToolCallID
+	}
+	if len(m.ToolCalls) > 0 {
+		var rawCalls []any
+		for _, tc := range m.ToolCalls {
+			tcType := tc.Type
+			if tcType == "" {
+				tcType = "function"
+			}
+			rawCalls = append(rawCalls, map[string]any{
+				"id":   tc.ID,
+				"type": tcType,
+				"function": map[string]any{
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+			})
+		}
+		m.data["tool_calls"] = rawCalls
+	}
+
+	if len(m.Parts) == 0 {
+		if len(m.ToolCalls) > 0 {
+			m.data["content"] = nil
+		} else {
+			m.data["content"] = ""
+		}
+	} else {
+		var rawParts []any
+		for i := range m.Parts {
+			exportedPart, err := m.Parts[i].Export()
+			if err != nil {
+				return nil, err
+			}
+			rawParts = append(rawParts, exportedPart)
+		}
+		m.data["content"] = rawParts
+	}
 	return m.data, nil
 }
 
@@ -190,10 +279,12 @@ type Parameters struct {
 }
 
 type Conversation struct {
-	Model      string     `json:"model"`
-	System     []string   `json:"system,omitempty"` // Unified system instructions (text-only)
-	Messages   []Message  `json:"messages"`         // Non-system interactive turns
-	Parameters Parameters `json:"parameters,omitempty"`
+	Model      string           `json:"model"`
+	System     []string         `json:"system,omitempty"` // Unified system instructions (text-only)
+	Messages   []Message        `json:"messages"`         // Non-system interactive turns
+	Tools      []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice any              `json:"tool_choice,omitempty"`
+	Parameters Parameters       `json:"parameters,omitempty"`
 	data       map[string]any
 }
 
@@ -217,7 +308,7 @@ func (c *Conversation) Import(blob any) error {
 				roleStr, _ := msgMap["role"].(string)
 				if Role(roleStr) == RoleSystem {
 					content, exists := msgMap["content"]
-					if exists {
+					if exists && content != nil {
 						texts, err := extractTextContent(content)
 						if err != nil {
 							return err
@@ -235,6 +326,26 @@ func (c *Conversation) Import(blob any) error {
 			messages = append(messages, m)
 		}
 		c.Messages = messages
+	}
+
+	if toolsBlob, exists := raw["tools"]; exists && toolsBlob != nil {
+		if tArr, ok := toolsBlob.([]any); ok {
+			var tools []ToolDefinition
+			for _, item := range tArr {
+				if itemMap, ok := item.(map[string]any); ok {
+					var td ToolDefinition
+					td.Type, _ = itemMap["type"].(string)
+					if fnMap, ok := itemMap["function"].(map[string]any); ok {
+						td.Function = fnMap
+					}
+					tools = append(tools, td)
+				}
+			}
+			c.Tools = tools
+		}
+	}
+	if tc, exists := raw["tool_choice"]; exists {
+		c.ToolChoice = tc
 	}
 
 	c.Parameters = extractParameters(raw)
@@ -267,6 +378,20 @@ func (c *Conversation) Export() (map[string]any, error) {
 		rawMsgs = append(rawMsgs, exportedMsg)
 	}
 	c.data["messages"] = rawMsgs
+
+	if len(c.Tools) > 0 {
+		var rawTools []any
+		for _, td := range c.Tools {
+			rawTools = append(rawTools, map[string]any{
+				"type":     td.Type,
+				"function": td.Function,
+			})
+		}
+		c.data["tools"] = rawTools
+	}
+	if c.ToolChoice != nil {
+		c.data["tool_choice"] = c.ToolChoice
+	}
 
 	syncParameters(c.data, c.Parameters)
 	return c.data, nil
@@ -344,6 +469,10 @@ func extractMeta(blob any) map[string]any {
 }
 
 func extractContentParts(content any) ([]Part, error) {
+	if content == nil {
+		return nil, nil
+	}
+
 	if s, ok := content.(string); ok {
 		p := Part{}
 		if err := p.Import(s); err != nil {
@@ -368,6 +497,10 @@ func extractContentParts(content any) ([]Part, error) {
 }
 
 func extractTextContent(content any) ([]string, error) {
+	if content == nil {
+		return nil, nil
+	}
+
 	if s, ok := content.(string); ok {
 		return []string{s}, nil
 	}

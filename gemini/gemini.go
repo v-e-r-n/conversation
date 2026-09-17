@@ -1,9 +1,11 @@
 package gemini
 
 import (
-	"github.com/v-e-r-n/conversation/core"
+	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/v-e-r-n/conversation/core"
 )
 
 type GeminiPart struct {
@@ -31,6 +33,7 @@ type GenerationConfig struct {
 
 type GeminiRequest struct {
 	Contents          []GeminiContent    `json:"contents"`
+	Tools             []any              `json:"tools,omitempty"`
 	SystemInstruction *SystemInstruction `json:"systemInstruction,omitempty"`
 	GenerationConfig  *GenerationConfig  `json:"generationConfig,omitempty"`
 }
@@ -53,40 +56,103 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*GeminiRequest, 
 		}
 	}
 
-	// 2. Map standard messages (user, model)
+	// 2. Map standard messages (user, model, function)
 	for _, msg := range c.Messages {
 		var gemMsg GeminiContent
 		role := "user"
 		if msg.Role == core.RoleAssistant {
 			role = "model"
+		} else if msg.Role == core.RoleTool {
+			role = "function"
 		}
 		gemMsg.Role = role
 
 		var gemParts []GeminiPart
-		for _, part := range msg.Parts {
-			rendered, err := renderPart(part.Content, part.Meta, part.Type, opts.Renderers)
-			if err != nil {
-				return nil, err
-			}
 
-			switch part.Type {
-			case "text":
-				if s, ok := rendered.(string); ok {
-					gemParts = append(gemParts, GeminiPart{Text: s})
+		if msg.Role == core.RoleTool {
+			var respObj any
+			if len(msg.Parts) > 0 {
+				if s, ok := msg.Parts[0].Content.(string); ok {
+					var parsed any
+					if err := json.Unmarshal([]byte(s), &parsed); err == nil {
+						respObj = parsed
+					} else {
+						respObj = s
+					}
 				} else {
+					respObj = msg.Parts[0].Content
+				}
+			}
+			name := msg.Name
+			if name == "" {
+				name = "function_response"
+			}
+			gemParts = append(gemParts, GeminiPart{
+				FunctionResponse: map[string]any{
+					"name": name,
+					"response": map[string]any{
+						"name":    name,
+						"content": respObj,
+					},
+				},
+			})
+		} else {
+			for _, part := range msg.Parts {
+				rendered, err := renderPart(part.Content, part.Meta, part.Type, opts.Renderers)
+				if err != nil {
+					return nil, err
+				}
+
+				switch part.Type {
+				case "text":
+					if s, ok := rendered.(string); ok {
+						gemParts = append(gemParts, GeminiPart{Text: s})
+					} else {
+						gemParts = append(gemParts, GeminiPart{Text: fmt.Sprintf("%v", rendered)})
+					}
+				case "image":
+					if m, ok := rendered.(map[string]any); ok {
+						gemParts = append(gemParts, GeminiPart{InlineData: m})
+					}
+				default:
 					gemParts = append(gemParts, GeminiPart{Text: fmt.Sprintf("%v", rendered)})
 				}
-			case "image":
-				if m, ok := rendered.(map[string]any); ok {
-					gemParts = append(gemParts, GeminiPart{InlineData: m})
+			}
+
+			if msg.Role == core.RoleAssistant && len(msg.ToolCalls) > 0 {
+				for _, tc := range msg.ToolCalls {
+					var argsMap map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &argsMap); err != nil {
+						argsMap = map[string]any{"raw": tc.Function.Arguments}
+					}
+					gemParts = append(gemParts, GeminiPart{
+						FunctionCall: map[string]any{
+							"name": tc.Function.Name,
+							"args": argsMap,
+						},
+					})
 				}
-			default:
-				gemParts = append(gemParts, GeminiPart{Text: fmt.Sprintf("%v", rendered)})
 			}
 		}
 
 		gemMsg.Parts = gemParts
 		contents = append(contents, gemMsg)
+	}
+
+	var gemTools []any
+	if len(c.Tools) > 0 {
+		var funcDecls []map[string]any
+		for _, td := range c.Tools {
+			fn := td.Function
+			funcDecls = append(funcDecls, map[string]any{
+				"name":        fn["name"],
+				"description": fn["description"],
+				"parameters":  fn["parameters"],
+			})
+		}
+		gemTools = append(gemTools, map[string]any{
+			"functionDeclarations": funcDecls,
+		})
 	}
 
 	var config *GenerationConfig
@@ -101,6 +167,7 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*GeminiRequest, 
 
 	return &GeminiRequest{
 		Contents:          contents,
+		Tools:             gemTools,
 		SystemInstruction: systemInstruction,
 		GenerationConfig:  config,
 	}, nil
