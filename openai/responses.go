@@ -11,17 +11,73 @@ import (
 
 // OpenAIResponseRequest represents a request to the OpenAI Responses API (/v1/responses).
 type OpenAIResponseRequest struct {
-	Model              string                `json:"model"`
-	Input              any                   `json:"input"`
-	Instructions       string                `json:"instructions,omitempty"`
-	PreviousResponseID string                `json:"previous_response_id,omitempty"`
-	Tools              []core.ToolDefinition `json:"tools,omitempty"`
-	ToolChoice         any                   `json:"tool_choice,omitempty"`
-	Temperature        *float64              `json:"temperature,omitempty"`
-	TopP               *float64              `json:"top_p,omitempty"`
-	MaxOutputTokens    *int                  `json:"max_output_tokens,omitempty"`
-	Stream             *bool                 `json:"stream,omitempty"`
-	Metadata           map[string]any        `json:"metadata,omitempty"`
+	Model              string         `json:"model"`
+	Input              any            `json:"input"`
+	Instructions       string         `json:"instructions,omitempty"`
+	PreviousResponseID string         `json:"previous_response_id,omitempty"`
+	Tools              []ResponseTool `json:"tools,omitempty"`
+	ToolChoice         any            `json:"tool_choice,omitempty"`
+	Temperature        *float64       `json:"temperature,omitempty"`
+	TopP               *float64       `json:"top_p,omitempty"`
+	MaxOutputTokens    *int           `json:"max_output_tokens,omitempty"`
+	Stream             *bool          `json:"stream,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+}
+
+// ResponseTool represents a tool declaration in the OpenAI Responses API.
+// In /v1/responses, tool properties are flat at the root of the tool object.
+type ResponseTool struct {
+	Type        string `json:"type"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+	Strict      *bool  `json:"strict,omitempty"`
+}
+
+func (t *ResponseTool) UnmarshalJSON(b []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	t.Type, _ = raw["type"].(string)
+	if t.Type == "" {
+		t.Type = "function"
+	}
+	if fn, ok := raw["function"].(map[string]any); ok {
+		t.Name, _ = fn["name"].(string)
+		t.Description, _ = fn["description"].(string)
+		t.Parameters = fn["parameters"]
+		if s, ok := fn["strict"].(bool); ok {
+			t.Strict = &s
+		}
+	} else {
+		t.Name, _ = raw["name"].(string)
+		t.Description, _ = raw["description"].(string)
+		t.Parameters = raw["parameters"]
+		if s, ok := raw["strict"].(bool); ok {
+			t.Strict = &s
+		}
+	}
+	return nil
+}
+
+func (t ResponseTool) MarshalJSON() ([]byte, error) {
+	m := map[string]any{
+		"type": t.Type,
+	}
+	if t.Name != "" {
+		m["name"] = t.Name
+	}
+	if t.Description != "" {
+		m["description"] = t.Description
+	}
+	if t.Parameters != nil {
+		m["parameters"] = t.Parameters
+	}
+	if t.Strict != nil {
+		m["strict"] = *t.Strict
+	}
+	return json.Marshal(m)
 }
 
 // ResponseItem represents a single item within the Responses API input array.
@@ -69,22 +125,35 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 	}
 
 	for _, item := range items {
+		callID := item.CallID
+		if callID == "" {
+			callID = item.ToolCallID
+		}
+
 		// Handle standalone function call items
 		if item.Type == "function_call" {
-			m := core.Message{
-				Role: core.RoleAssistant,
-				ToolCalls: []core.ToolCall{
-					{
-						ID:   item.CallID,
-						Type: "function",
-						Function: core.ToolFunction{
-							Name:      item.Name,
-							Arguments: item.Arguments,
-						},
-					},
+			args := item.Arguments
+			if args == "" {
+				args = "{}"
+			}
+			tc := core.ToolCall{
+				ID:   callID,
+				Type: "function",
+				Function: core.ToolFunction{
+					Name:      item.Name,
+					Arguments: args,
 				},
 			}
-			c.Messages = append(c.Messages, m)
+			// Merge into immediately preceding assistant turn if present to preserve turn unity
+			if len(c.Messages) > 0 && c.Messages[len(c.Messages)-1].Role == core.RoleAssistant {
+				lastIdx := len(c.Messages) - 1
+				c.Messages[lastIdx].ToolCalls = append(c.Messages[lastIdx].ToolCalls, tc)
+			} else {
+				c.Messages = append(c.Messages, core.Message{
+					Role:      core.RoleAssistant,
+					ToolCalls: []core.ToolCall{tc},
+				})
+			}
 			continue
 		}
 
@@ -92,16 +161,11 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 		if item.Type == "function_call_output" {
 			outputStr := ""
 			if item.Output != nil {
-				if s, ok := item.Output.(string); ok {
-					outputStr = s
-				} else {
-					b, _ := json.Marshal(item.Output)
-					outputStr = string(b)
-				}
+				outputStr = formatToolOutput(item.Output)
 			}
 			m := core.Message{
 				Role:       core.RoleTool,
-				ToolCallID: item.CallID,
+				ToolCallID: callID,
 				Parts: []core.Part{
 					{
 						Type:    "text",
@@ -119,7 +183,8 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 			role = "user"
 		}
 
-		if role == "system" {
+		// Modern OpenAI models use developer role alongside system
+		if role == "system" || role == "developer" {
 			texts, err := extractTextContent(item.Content)
 			if err != nil {
 				return nil, err
@@ -133,8 +198,8 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 		m.Name = item.Name
 		m.ToolCalls = item.ToolCalls
 		m.ToolCallID = item.ToolCallID
-		if m.ToolCallID == "" && item.CallID != "" && role == "tool" {
-			m.ToolCallID = item.CallID
+		if m.ToolCallID == "" && callID != "" && role == "tool" {
+			m.ToolCallID = callID
 		}
 
 		parts, err := extractResponseContentParts(item.Content, item.Meta)
@@ -158,7 +223,28 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 	}
 
 	// 4. Tools & Parameters
-	c.Tools = req.Tools
+	for _, rt := range req.Tools {
+		td := core.ToolDefinition{
+			Type: rt.Type,
+		}
+		if rt.Name != "" || rt.Description != "" || rt.Parameters != nil || rt.Strict != nil {
+			fnMap := map[string]any{}
+			if rt.Name != "" {
+				fnMap["name"] = rt.Name
+			}
+			if rt.Description != "" {
+				fnMap["description"] = rt.Description
+			}
+			if rt.Parameters != nil {
+				fnMap["parameters"] = rt.Parameters
+			}
+			if rt.Strict != nil {
+				fnMap["strict"] = *rt.Strict
+			}
+			td.Function = fnMap
+		}
+		c.Tools = append(c.Tools, td)
+	}
 	c.ToolChoice = req.ToolChoice
 
 	c.Parameters.Temperature = req.Temperature
@@ -185,8 +271,22 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 
 	req := &OpenAIResponseRequest{
 		Model:      model,
-		Tools:      c.Tools,
 		ToolChoice: c.ToolChoice,
+	}
+
+	for _, td := range c.Tools {
+		rt := ResponseTool{
+			Type: td.Type,
+		}
+		if td.Function != nil {
+			rt.Name, _ = td.Function["name"].(string)
+			rt.Description, _ = td.Function["description"].(string)
+			rt.Parameters = td.Function["parameters"]
+			if s, ok := td.Function["strict"].(bool); ok {
+				rt.Strict = &s
+			}
+		}
+		req.Tools = append(req.Tools, rt)
 	}
 
 	// 1. Format directives into instructions
@@ -200,15 +300,7 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 	for _, msg := range c.Messages {
 		// Tool call emitted by assistant
 		if msg.Role == core.RoleAssistant && len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				items = append(items, ResponseItem{
-					Type:      "function_call",
-					CallID:    tc.ID,
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				})
-			}
-			// If message also contains text content, emit it as an assistant message
+			// Chronology fix: assistant text message emitted FIRST
 			if len(msg.Parts) > 0 {
 				renderedParts, err := renderResponseParts(msg.Parts, renderers)
 				if err != nil {
@@ -218,6 +310,19 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 					Type:    "message",
 					Role:    "assistant",
 					Content: formatItemContent(renderedParts, msg.Parts),
+				})
+			}
+			// Function calls emitted SECOND
+			for _, tc := range msg.ToolCalls {
+				args := tc.Function.Arguments
+				if args == "" {
+					args = "{}"
+				}
+				items = append(items, ResponseItem{
+					Type:      "function_call",
+					CallID:    tc.ID,
+					Name:      tc.Function.Name,
+					Arguments: args,
 				})
 			}
 			continue

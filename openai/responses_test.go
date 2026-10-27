@@ -82,13 +82,11 @@ func TestFromResponseRequest_MultiTurnAndTools(t *testing.T) {
 				Content: "Your order has been shipped.",
 			},
 		},
-		Tools: []core.ToolDefinition{
+		Tools: []ResponseTool{
 			{
-				Type: "function",
-				Function: map[string]any{
-					"name":        "get_order",
-					"description": "Look up an order by ID",
-				},
+				Type:        "function",
+				Name:        "get_order",
+				Description: "Look up an order by ID",
 			},
 		},
 	}
@@ -225,13 +223,11 @@ func TestToResponseRequest_EquivalenceRoundTrip(t *testing.T) {
 				Content: "The answer is 4.",
 			},
 		},
-		Tools: []core.ToolDefinition{
+		Tools: []ResponseTool{
 			{
-				Type: "function",
-				Function: map[string]any{
-					"name":        "calculate",
-					"description": "Perform arithmetic",
-				},
+				Type:        "function",
+				Name:        "calculate",
+				Description: "Perform arithmetic",
 			},
 		},
 	}
@@ -501,5 +497,342 @@ func TestValidationAndNilHandling(t *testing.T) {
 	}
 	if _, err := FromResponseRequest(invalidReq); err == nil {
 		t.Error("expected error for invalid input type")
+	}
+}
+
+func TestResponseTool_FlatJSONSerialization(t *testing.T) {
+	strict := true
+	tools := []ResponseTool{
+		{
+			Type:        "function",
+			Name:        "get_weather",
+			Description: "Get the current weather",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"location": map[string]any{"type": "string"},
+				},
+				"required": []any{"location"},
+			},
+			Strict: &strict,
+		},
+		{
+			Type: "web_search",
+		},
+	}
+
+	req := &OpenAIResponseRequest{
+		Model: "gpt-4o",
+		Tools: tools,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	rawTools, ok := raw["tools"].([]any)
+	if !ok || len(rawTools) != 2 {
+		t.Fatalf("expected 2 tools in JSON, got %v", raw["tools"])
+	}
+
+	tool0 := rawTools[0].(map[string]any)
+	if _, hasNestedFn := tool0["function"]; hasNestedFn {
+		t.Errorf("critical schema failure: tool definition contains nested 'function' key: %v", tool0)
+	}
+	if tool0["type"] != "function" || tool0["name"] != "get_weather" {
+		t.Errorf("unexpected tool 0 attributes: %v", tool0)
+	}
+	if tool0["strict"] != true {
+		t.Errorf("expected strict true, got %v", tool0["strict"])
+	}
+
+	tool1 := rawTools[1].(map[string]any)
+	if tool1["type"] != "web_search" {
+		t.Errorf("unexpected built-in tool type: %v", tool1)
+	}
+	if _, hasName := tool1["name"]; hasName {
+		t.Errorf("built-in tool should omit empty name: %v", tool1)
+	}
+
+	// Test unmarshaling of legacy nested format as fallback
+	legacyJSON := `[
+		{
+			"type": "function",
+			"function": {
+				"name": "legacy_lookup",
+				"description": "Legacy format description",
+				"parameters": {"type": "object"}
+			}
+		}
+	]`
+	var unmarshaledTools []ResponseTool
+	if err := json.Unmarshal([]byte(legacyJSON), &unmarshaledTools); err != nil {
+		t.Fatalf("failed to unmarshal legacy nested tools: %v", err)
+	}
+	if len(unmarshaledTools) != 1 || unmarshaledTools[0].Name != "legacy_lookup" {
+		t.Fatalf("unexpected unmarshaled legacy tool: %+v", unmarshaledTools)
+	}
+}
+
+func TestAssistantTurnCohesion_TextAndFunctionCall(t *testing.T) {
+	// 1. Export: assistant message with text + tool call -> emits message followed by function_call
+	conv := &core.Conversation{
+		Model: "gpt-4o",
+		Messages: []core.Message{
+			{
+				Role: core.RoleAssistant,
+				Parts: []core.Part{
+					{Type: "text", Content: "Let me check that order for you."},
+				},
+				ToolCalls: []core.ToolCall{
+					{
+						ID: "call_check_99",
+						Function: core.ToolFunction{
+							Name:      "lookup_order",
+							Arguments: `{"id":99}`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	req, err := ToResponseRequest(conv, nil)
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	items, ok := req.Input.([]ResponseItem)
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected 2 response items, got %v", req.Input)
+	}
+
+	// Must preserve chronological order: message precedes function_call
+	if items[0].Type != "message" || items[0].Role != "assistant" {
+		t.Errorf("expected first item to be assistant message, got %+v", items[0])
+	}
+	if items[1].Type != "function_call" || items[1].CallID != "call_check_99" {
+		t.Errorf("expected second item to be function_call, got %+v", items[1])
+	}
+
+	// 2. Import: message followed by function_call -> collapsed back into single assistant turn
+	roundTripConv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	if len(roundTripConv.Messages) != 1 {
+		t.Fatalf("expected 1 consolidated assistant message, got %d", len(roundTripConv.Messages))
+	}
+	resMsg := roundTripConv.Messages[0]
+	if resMsg.Role != core.RoleAssistant {
+		t.Errorf("expected role assistant, got %s", resMsg.Role)
+	}
+	if len(resMsg.Parts) != 1 || resMsg.Parts[0].Content != "Let me check that order for you." {
+		t.Errorf("unexpected parts in merged message: %+v", resMsg.Parts)
+	}
+	if len(resMsg.ToolCalls) != 1 || resMsg.ToolCalls[0].ID != "call_check_99" {
+		t.Errorf("unexpected tool calls in merged message: %+v", resMsg.ToolCalls)
+	}
+}
+
+func TestDeveloperRole_CollapsesIntoSystem(t *testing.T) {
+	req := &OpenAIResponseRequest{
+		Model:        "gpt-4o",
+		Instructions: "Base system prompt.",
+		Input: []ResponseItem{
+			{
+				Type:    "message",
+				Role:    "developer",
+				Content: "Developer instructions: keep answers brief.",
+			},
+			{
+				Type:    "message",
+				Role:    "user",
+				Content: "Hello!",
+			},
+		},
+	}
+
+	conv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	// System should have both Base system prompt and Developer instructions
+	if len(conv.System) != 2 {
+		t.Fatalf("expected 2 system prompts, got %d: %v", len(conv.System), conv.System)
+	}
+	if conv.System[0] != "Base system prompt." || conv.System[1] != "Developer instructions: keep answers brief." {
+		t.Errorf("unexpected system slice contents: %v", conv.System)
+	}
+
+	// Messages should only contain the user message (developer role collapsed into System)
+	if len(conv.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(conv.Messages))
+	}
+	if conv.Messages[0].Role != core.RoleUser {
+		t.Errorf("expected user role, got %s", conv.Messages[0].Role)
+	}
+}
+
+func TestCallIDFallback_ToolCallID(t *testing.T) {
+	req := &OpenAIResponseRequest{
+		Model: "gpt-4o",
+		Input: []ResponseItem{
+			{
+				Type:       "function_call",
+				ToolCallID: "tc_legacy_123", // CallID is empty, ToolCallID populated
+				Name:       "ping",
+				Arguments:  `{}`,
+			},
+			{
+				Type:       "function_call_output",
+				ToolCallID: "tc_legacy_123", // CallID is empty, ToolCallID populated
+				Output:     "pong",
+			},
+		},
+	}
+
+	conv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	if len(conv.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(conv.Messages))
+	}
+
+	// Verify function_call ID fallback
+	if len(conv.Messages[0].ToolCalls) != 1 || conv.Messages[0].ToolCalls[0].ID != "tc_legacy_123" {
+		t.Errorf("expected tool call ID 'tc_legacy_123', got %+v", conv.Messages[0].ToolCalls)
+	}
+
+	// Verify function_call_output ToolCallID fallback
+	if conv.Messages[1].ToolCallID != "tc_legacy_123" {
+		t.Errorf("expected tool output ToolCallID 'tc_legacy_123', got %q", conv.Messages[1].ToolCallID)
+	}
+}
+
+func TestEmptyToolArguments_DefaultsToEmptyJSON(t *testing.T) {
+	// 1. FromResponseRequest defaults empty arguments to "{}"
+	req := &OpenAIResponseRequest{
+		Model: "gpt-4o",
+		Input: []ResponseItem{
+			{
+				Type:      "function_call",
+				CallID:    "call_no_args",
+				Name:      "get_current_time",
+				Arguments: "", // empty
+			},
+		},
+	}
+
+	conv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	if len(conv.Messages) != 1 || len(conv.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("expected 1 message with 1 tool call, got %+v", conv.Messages)
+	}
+	if conv.Messages[0].ToolCalls[0].Function.Arguments != "{}" {
+		t.Errorf("expected default '{}' arguments, got %q", conv.Messages[0].ToolCalls[0].Function.Arguments)
+	}
+
+	// 2. ToResponseRequest defaults empty arguments to "{}"
+	convEmptyArgs := &core.Conversation{
+		Model: "gpt-4o",
+		Messages: []core.Message{
+			{
+				Role: core.RoleAssistant,
+				ToolCalls: []core.ToolCall{
+					{
+						ID: "call_empty_args",
+						Function: core.ToolFunction{
+							Name:      "ping",
+							Arguments: "", // empty
+						},
+					},
+				},
+			},
+		},
+	}
+
+	exportedReq, err := ToResponseRequest(convEmptyArgs, nil)
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	items, ok := exportedReq.Input.([]ResponseItem)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected 1 ResponseItem, got %v", exportedReq.Input)
+	}
+	if items[0].Arguments != "{}" {
+		t.Errorf("expected exported Arguments '{}', got %q", items[0].Arguments)
+	}
+}
+
+func TestMultiModal_InputAudioExport(t *testing.T) {
+	audioPayload := map[string]any{
+		"data":   "UklGRigAAABXQVZFZm10IBIA...",
+		"format": "wav",
+	}
+
+	conv := &core.Conversation{
+		Model: "gpt-4o",
+		Messages: []core.Message{
+			{
+				Role: core.RoleUser,
+				Parts: []core.Part{
+					{
+						Type:    "audio",
+						Content: audioPayload,
+					},
+				},
+			},
+		},
+	}
+
+	req, err := ToResponseRequest(conv, nil)
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	items, ok := req.Input.([]ResponseItem)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected 1 ResponseItem, got %v", req.Input)
+	}
+
+	contentParts, ok := items[0].Content.([]map[string]any)
+	if !ok || len(contentParts) != 1 {
+		t.Fatalf("expected 1 content part map, got %v", items[0].Content)
+	}
+
+	part := contentParts[0]
+	if part["type"] != "input_audio" {
+		t.Errorf("expected part type input_audio, got %v", part["type"])
+	}
+	audioObj, ok := part["input_audio"].(map[string]any)
+	if !ok || audioObj["format"] != "wav" {
+		t.Errorf("expected input_audio map with format 'wav', got %v", part["input_audio"])
+	}
+
+	// Test FromResponseRequest parsing back
+	conv2, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+	if len(conv2.Messages) != 1 || len(conv2.Messages[0].Parts) != 1 {
+		t.Fatalf("expected 1 message with 1 part, got %+v", conv2.Messages)
+	}
+	if conv2.Messages[0].Parts[0].Type != "audio" {
+		t.Errorf("expected part type audio, got %s", conv2.Messages[0].Parts[0].Type)
 	}
 }
