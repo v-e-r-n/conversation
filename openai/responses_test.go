@@ -836,3 +836,55 @@ func TestMultiModal_InputAudioExport(t *testing.T) {
 		t.Errorf("expected part type audio, got %s", conv2.Messages[0].Parts[0].Type)
 	}
 }
+
+func TestStore_ParameterRoundTripAndExport(t *testing.T) {
+	storeFalse := false
+	req := &OpenAIResponseRequest{
+		Model: "gpt-4o",
+		Input: "Testing store false",
+		Store: &storeFalse,
+	}
+
+	conv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	if val, ok := conv.GetMeta("store").(bool); !ok || val != false {
+		t.Errorf("expected store=false in conversation meta, got %v", conv.GetMeta("store"))
+	}
+
+	// 1. Export without options (uses meta)
+	exported, err := ToResponseRequest(conv, nil)
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+	if exported.Store == nil || *exported.Store != false {
+		t.Errorf("expected exported Store false, got %v", exported.Store)
+	}
+
+	// Verify JSON serialization includes "store": false
+	b, err := json.Marshal(exported)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if raw["store"] != false {
+		t.Errorf("expected JSON payload to contain store: false, got %v", raw["store"])
+	}
+
+	// 2. Export with override in ExportOptions
+	storeTrue := true
+	exportedWithOverride, err := ToResponseRequest(conv, &core.ExportOptions{
+		Store: &storeTrue,
+	})
+	if err != nil {
+		t.Fatalf("ToResponseRequest with override failed: %v", err)
+	}
+	if exportedWithOverride.Store == nil || *exportedWithOverride.Store != true {
+		t.Errorf("expected overridden Store true, got %v", exportedWithOverride.Store)
+	}
+}

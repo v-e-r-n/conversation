@@ -21,6 +21,7 @@ type OpenAIResponseRequest struct {
 	TopP               *float64       `json:"top_p,omitempty"`
 	MaxOutputTokens    *int           `json:"max_output_tokens,omitempty"`
 	Stream             *bool          `json:"stream,omitempty"`
+	Store              *bool          `json:"store,omitempty"`
 	Metadata           map[string]any `json:"metadata,omitempty"`
 }
 
@@ -218,6 +219,9 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 	if req.Stream != nil {
 		c.SetMeta("stream", *req.Stream)
 	}
+	if req.Store != nil {
+		c.SetMeta("store", *req.Store)
+	}
 	if req.Metadata != nil {
 		c.SetMeta("metadata", req.Metadata)
 	}
@@ -381,6 +385,12 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 		req.Stream = opts.Stream
 	} else if streamVal, ok := c.GetMeta("stream").(bool); ok {
 		req.Stream = &streamVal
+	}
+
+	if opts != nil && opts.Store != nil {
+		req.Store = opts.Store
+	} else if storeVal, ok := c.GetMeta("store").(bool); ok {
+		req.Store = &storeVal
 	}
 
 	if metaVal, ok := c.GetMeta("metadata").(map[string]any); ok && metaVal != nil {

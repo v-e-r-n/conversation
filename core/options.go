@@ -12,6 +12,7 @@ func DefaultRenderer(content any, meta map[string]any) (any, error) {
 type ExportOptions struct {
 	Model            string              // Override target model name
 	Stream           *bool               // Override stream parameter
+	Store            *bool               // Override store parameter
 	Renderers        map[string]Renderer // Custom renderers keyed by part type (e.g. "text", "image")
 	DefaultMaxTokens int                 // Fallback max tokens if not set on the conversation
 }
