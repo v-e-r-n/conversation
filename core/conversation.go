@@ -285,6 +285,7 @@ type Conversation struct {
 	Tools      []ToolDefinition `json:"tools,omitempty"`
 	ToolChoice any              `json:"tool_choice,omitempty"`
 	Parameters Parameters       `json:"parameters,omitempty"`
+	Meta       map[string]any   `json:"meta,omitempty"`
 	data       map[string]any
 }
 
@@ -295,6 +296,7 @@ func (c *Conversation) Import(blob any) error {
 	}
 	c.data = raw
 	c.Model, _ = raw["model"].(string)
+	c.Meta = extractMeta(raw["meta"])
 
 	c.System = nil
 	if sysPrompt, ok := raw["system_prompt"].(string); ok && sysPrompt != "" {
@@ -394,7 +396,35 @@ func (c *Conversation) Export() (map[string]any, error) {
 	}
 
 	syncParameters(c.data, c.Parameters)
+
+	if len(c.Meta) > 0 {
+		c.data["meta"] = c.Meta
+	} else {
+		delete(c.data, "meta")
+	}
+
 	return c.data, nil
+}
+
+// SetMeta sets a metadata key-value pair on the Conversation.
+func (c *Conversation) SetMeta(key string, val any) {
+	if c.Meta == nil {
+		c.Meta = make(map[string]any)
+	}
+	c.Meta[key] = val
+}
+
+// GetMeta retrieves a metadata value by key, or nil if not present.
+func (c *Conversation) GetMeta(key string) any {
+	if c.Meta == nil {
+		return nil
+	}
+	return c.Meta[key]
+}
+
+// MetaMap returns the full metadata map for the Conversation.
+func (c *Conversation) MetaMap() map[string]any {
+	return c.Meta
 }
 
 func (c *Conversation) UnmarshalJSON(b []byte) error {

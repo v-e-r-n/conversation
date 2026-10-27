@@ -42,9 +42,9 @@ func TestFromResponseRequest_SimpleStringInput(t *testing.T) {
 		t.Errorf("unexpected message part: %+v", msg.Parts)
 	}
 
-	// Verify previous_response_id is preserved in metadata
-	if prevID, ok := msg.Parts[0].Meta["previous_response_id"].(string); !ok || prevID != "resp_init_001" {
-		t.Errorf("expected previous_response_id 'resp_init_001' in metadata, got %v", msg.Parts[0].Meta)
+	// Verify previous_response_id is preserved in conversation metadata
+	if prevID, ok := conv.GetMeta("previous_response_id").(string); !ok || prevID != "resp_init_001" {
+		t.Errorf("expected previous_response_id 'resp_init_001' in conversation metadata, got %v", conv.Meta)
 	}
 
 	if conv.Parameters.Temperature == nil || *conv.Parameters.Temperature != 0.7 {
@@ -264,8 +264,11 @@ func TestToResponseRequest_EquivalenceRoundTrip(t *testing.T) {
 	if *exportedReq.TopP != *originalReq.TopP {
 		t.Errorf("expected top_p %v, got %v", *originalReq.TopP, *exportedReq.TopP)
 	}
-	if *exportedReq.MaxOutputTokens != *originalReq.MaxOutputTokens {
+	if exportedReq.MaxOutputTokens != nil && *exportedReq.MaxOutputTokens != *originalReq.MaxOutputTokens {
 		t.Errorf("expected max_output_tokens %v, got %v", *originalReq.MaxOutputTokens, *exportedReq.MaxOutputTokens)
+	}
+	if exportedReq.Stream == nil || *exportedReq.Stream != *originalReq.Stream {
+		t.Errorf("expected stream %v, got %v", *originalReq.Stream, exportedReq.Stream)
 	}
 
 	// 3. Second round-trip: FromResponseRequest(exportedReq) -> conv2
@@ -284,6 +287,160 @@ func TestToResponseRequest_EquivalenceRoundTrip(t *testing.T) {
 		if len(conv2.Messages[i].ToolCalls) != len(conv.Messages[i].ToolCalls) {
 			t.Errorf("msg %d tool calls length mismatch: %d vs %d", i, len(conv.Messages[i].ToolCalls), len(conv2.Messages[i].ToolCalls))
 		}
+	}
+}
+
+func TestRenderResponseParts_NoMetaLeakage(t *testing.T) {
+	part := core.Part{
+		Type:    "text",
+		Content: "Hello world with secret metadata",
+	}
+	part.SetMeta("secret_tracing_id", "trace_xyz_789")
+	part.SetMeta("previous_response_id", "resp_secret_123")
+
+	conv := &core.Conversation{
+		Model: "gpt-4o",
+		Messages: []core.Message{
+			{
+				Role:  core.RoleUser,
+				Parts: []core.Part{part},
+			},
+		},
+	}
+
+	req, err := ToResponseRequest(conv, &core.ExportOptions{})
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	// Ensure no "meta" key leaked into JSON payload
+	inputs, ok := raw["input"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("expected input array, got %v", raw["input"])
+	}
+
+	for _, item := range inputs {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, exists := itemMap["meta"]; exists {
+			t.Errorf("critical schema leakage: found 'meta' key in ResponseItem: %v", itemMap)
+		}
+		if contentArr, ok := itemMap["content"].([]any); ok {
+			for _, partObj := range contentArr {
+				if partMap, ok := partObj.(map[string]any); ok {
+					if _, exists := partMap["meta"]; exists {
+						t.Errorf("critical schema leakage: found 'meta' key in content part: %v", partMap)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestToResponseRequest_ToolOutputStructuredJSON(t *testing.T) {
+	structuredData := map[string]any{
+		"status":      "ok",
+		"temperature": 72,
+	}
+
+	conv := &core.Conversation{
+		Model: "gpt-4o",
+		Messages: []core.Message{
+			{
+				Role:       core.RoleTool,
+				ToolCallID: "call_weather_1",
+				Parts: []core.Part{
+					{
+						Type:    "text",
+						Content: structuredData,
+					},
+				},
+			},
+		},
+	}
+
+	req, err := ToResponseRequest(conv, &core.ExportOptions{})
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	items, ok := req.Input.([]ResponseItem)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected 1 ResponseItem in input, got %v", req.Input)
+	}
+
+	item := items[0]
+	if item.Type != "function_call_output" {
+		t.Errorf("expected type function_call_output, got %s", item.Type)
+	}
+
+	outputStr, ok := item.Output.(string)
+	if !ok {
+		t.Fatalf("expected string output, got %T: %v", item.Output, item.Output)
+	}
+
+	// Must be parseable JSON, NOT Go debug string "map[status:ok temperature:72]"
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(outputStr), &parsed); err != nil {
+		t.Fatalf("tool output is not valid JSON (%q): %v", outputStr, err)
+	}
+	if parsed["status"] != "ok" || parsed["temperature"] != float64(72) {
+		t.Errorf("unexpected parsed tool output content: %+v", parsed)
+	}
+}
+
+func TestPreviousResponseID_And_Metadata_PreservedOnEmptyMessages(t *testing.T) {
+	stream := true
+	req := &OpenAIResponseRequest{
+		Model:              "gpt-4o",
+		Instructions:       "You are an AI assistant.",
+		PreviousResponseID: "resp_empty_turn_1",
+		Stream:             &stream,
+		Metadata: map[string]any{
+			"org_id":     "org_12345",
+			"project_id": "proj_abcde",
+		},
+		Input: nil, // zero messages
+	}
+
+	conv, err := FromResponseRequest(req)
+	if err != nil {
+		t.Fatalf("FromResponseRequest failed: %v", err)
+	}
+
+	if len(conv.Messages) != 0 {
+		t.Fatalf("expected 0 messages, got %d", len(conv.Messages))
+	}
+
+	// Re-export
+	exported, err := ToResponseRequest(conv, nil)
+	if err != nil {
+		t.Fatalf("ToResponseRequest failed: %v", err)
+	}
+
+	if exported.PreviousResponseID != "resp_empty_turn_1" {
+		t.Errorf("expected PreviousResponseID 'resp_empty_turn_1', got %q", exported.PreviousResponseID)
+	}
+	if exported.Stream == nil || *exported.Stream != true {
+		t.Errorf("expected Stream true, got %v", exported.Stream)
+	}
+	if exported.Metadata == nil || exported.Metadata["org_id"] != "org_12345" {
+		t.Errorf("expected Metadata with org_id 'org_12345', got %v", exported.Metadata)
+	}
+	if exported.Instructions != "You are an AI assistant." {
+		t.Errorf("expected Instructions preserved, got %q", exported.Instructions)
 	}
 }
 

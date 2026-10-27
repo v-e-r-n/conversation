@@ -146,17 +146,15 @@ func FromResponseRequest(req *OpenAIResponseRequest) (*core.Conversation, error)
 		c.Messages = append(c.Messages, m)
 	}
 
-	// 3. Preserve previous_response_id in metadata
+	// 3. Preserve previous_response_id, stream, and metadata on core.Conversation
 	if req.PreviousResponseID != "" {
-		if len(c.Messages) > 0 && len(c.Messages[0].Parts) > 0 {
-			c.Messages[0].Parts[0].SetMeta("previous_response_id", req.PreviousResponseID)
-		} else if len(c.Messages) > 0 {
-			c.Messages[0].Parts = append(c.Messages[0].Parts, core.Part{
-				Type:    "text",
-				Content: "",
-				Meta:    map[string]any{"previous_response_id": req.PreviousResponseID},
-			})
-		}
+		c.SetMeta("previous_response_id", req.PreviousResponseID)
+	}
+	if req.Stream != nil {
+		c.SetMeta("stream", *req.Stream)
+	}
+	if req.Metadata != nil {
+		c.SetMeta("metadata", req.Metadata)
 	}
 
 	// 4. Tools & Parameters
@@ -229,7 +227,7 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 		if msg.Role == core.RoleTool {
 			outputStr := ""
 			if len(msg.Parts) > 0 {
-				outputStr = fmt.Sprintf("%v", msg.Parts[0].Content)
+				outputStr = formatToolOutput(msg.Parts[0].Content)
 			}
 			items = append(items, ResponseItem{
 				Type:   "function_call_output",
@@ -256,17 +254,32 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 
 	req.Input = items
 
-	// 3. Extract previous_response_id from message metadata if present
-	for _, msg := range c.Messages {
-		for _, part := range msg.Parts {
-			if val, ok := part.Meta["previous_response_id"].(string); ok && val != "" {
-				req.PreviousResponseID = val
+	// 3. Extract previous_response_id, stream, and metadata
+	if prevID, ok := c.GetMeta("previous_response_id").(string); ok && prevID != "" {
+		req.PreviousResponseID = prevID
+	}
+	if req.PreviousResponseID == "" {
+		for _, msg := range c.Messages {
+			for _, part := range msg.Parts {
+				if val, ok := part.Meta["previous_response_id"].(string); ok && val != "" {
+					req.PreviousResponseID = val
+					break
+				}
+			}
+			if req.PreviousResponseID != "" {
 				break
 			}
 		}
-		if req.PreviousResponseID != "" {
-			break
-		}
+	}
+
+	if opts != nil && opts.Stream != nil {
+		req.Stream = opts.Stream
+	} else if streamVal, ok := c.GetMeta("stream").(bool); ok {
+		req.Stream = &streamVal
+	}
+
+	if metaVal, ok := c.GetMeta("metadata").(map[string]any); ok && metaVal != nil {
+		req.Metadata = metaVal
 	}
 
 	// 4. Parameters
@@ -275,6 +288,24 @@ func ToResponseRequest(c *core.Conversation, opts *core.ExportOptions) (*OpenAIR
 	req.MaxOutputTokens = c.Parameters.MaxTokens
 
 	return req, nil
+}
+
+func formatToolOutput(content any) string {
+	if content == nil {
+		return ""
+	}
+	switch v := content.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(b)
+	}
 }
 
 func renderResponseParts(parts []core.Part, renderers map[string]core.Renderer) ([]map[string]any, error) {
@@ -287,41 +318,25 @@ func renderResponseParts(parts []core.Part, renderers map[string]core.Renderer) 
 
 		switch part.Type {
 		case "text":
-			m := map[string]any{
+			renderedParts = append(renderedParts, map[string]any{
 				"type": "input_text",
 				"text": rendered,
-			}
-			if len(part.Meta) > 0 {
-				m["meta"] = part.Meta
-			}
-			renderedParts = append(renderedParts, m)
+			})
 		case "image":
-			m := map[string]any{
+			renderedParts = append(renderedParts, map[string]any{
 				"type":      "input_image",
 				"image_url": rendered,
-			}
-			if len(part.Meta) > 0 {
-				m["meta"] = part.Meta
-			}
-			renderedParts = append(renderedParts, m)
+			})
 		case "audio":
-			m := map[string]any{
+			renderedParts = append(renderedParts, map[string]any{
 				"type":        "input_audio",
 				"input_audio": rendered,
-			}
-			if len(part.Meta) > 0 {
-				m["meta"] = part.Meta
-			}
-			renderedParts = append(renderedParts, m)
+			})
 		default:
-			m := map[string]any{
+			renderedParts = append(renderedParts, map[string]any{
 				"type":    part.Type,
 				part.Type: rendered,
-			}
-			if len(part.Meta) > 0 {
-				m["meta"] = part.Meta
-			}
-			renderedParts = append(renderedParts, m)
+			})
 		}
 	}
 	return renderedParts, nil
