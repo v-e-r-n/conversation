@@ -8,6 +8,15 @@ import (
 	"github.com/v-e-r-n/conversation/core"
 )
 
+type Metadata struct {
+	UserID string `json:"user_id,omitempty"`
+}
+
+type ThinkingConfig struct {
+	Type         string `json:"type"` // "enabled" | "disabled"
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
 type AnthropicMessage struct {
 	Role    string `json:"role"`
 	Content any    `json:"content"` // can be string or []any parts
@@ -16,13 +25,16 @@ type AnthropicMessage struct {
 type AnthropicRequest struct {
 	Model         string             `json:"model"`
 	Messages      []AnthropicMessage `json:"messages"`
-	System        string             `json:"system,omitempty"`
+	System        any                `json:"system,omitempty"` // string or []any content blocks
 	Tools         []any              `json:"tools,omitempty"`
 	ToolChoice    any                `json:"tool_choice,omitempty"`
 	MaxTokens     int                `json:"max_tokens"`
 	Temperature   *float64           `json:"temperature,omitempty"`
 	TopP          *float64           `json:"top_p,omitempty"`
 	StopSequences []string           `json:"stop_sequences,omitempty"`
+	Stream        bool               `json:"stream,omitempty"`
+	Metadata      *Metadata          `json:"metadata,omitempty"`
+	Thinking      *ThinkingConfig    `json:"thinking,omitempty"`
 }
 
 // ToRequest translates core.Conversation to AnthropicRequest.
@@ -90,6 +102,19 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 						"type": "text",
 						"text": rendered,
 					})
+				case "thinking":
+					sigVal := ""
+					if part.Meta != nil {
+						if sig, ok := part.Meta["signature"].(string); ok {
+							sigVal = sig
+						}
+					}
+					renderedParts = append(renderedParts, map[string]any{
+						"type":      "thinking",
+						"thinking":  rendered,
+						"signature": sigVal,
+					})
+					hasRichContent = true
 				case "image":
 					renderedParts = append(renderedParts, map[string]any{
 						"type":   "image",
@@ -145,6 +170,24 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 		antTools = append(antTools, toolMap)
 	}
 
+	var metadata *Metadata
+	if c.Meta != nil {
+		if uid, ok := c.Meta["user_id"].(string); ok && uid != "" {
+			metadata = &Metadata{UserID: uid}
+		} else if uid, ok := c.Meta["user"].(string); ok && uid != "" {
+			metadata = &Metadata{UserID: uid}
+		}
+	}
+
+	var stream bool
+	if opts.Stream != nil {
+		stream = *opts.Stream
+	} else if c.Meta != nil {
+		if s, ok := c.Meta["stream"].(bool); ok {
+			stream = s
+		}
+	}
+
 	return &AnthropicRequest{
 		Model:         model,
 		Messages:      anthropicMsgs,
@@ -155,6 +198,8 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 		Temperature:   c.Parameters.Temperature,
 		TopP:          c.Parameters.TopP,
 		StopSequences: c.Parameters.Stop,
+		Stream:        stream,
+		Metadata:      metadata,
 	}, nil
 }
 
@@ -166,8 +211,21 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 
 	var c core.Conversation
 	c.Model = req.Model
-	if req.System != "" {
-		c.System = []string{req.System}
+
+	if req.System != nil {
+		if sysStr, ok := req.System.(string); ok && sysStr != "" {
+			c.System = []string{sysStr}
+		} else if sysArr, ok := req.System.([]any); ok {
+			for _, item := range sysArr {
+				if s, ok := item.(string); ok && s != "" {
+					c.System = append(c.System, s)
+				} else if m, ok := item.(map[string]any); ok {
+					if t, ok := m["text"].(string); ok && t != "" {
+						c.System = append(c.System, t)
+					}
+				}
+			}
+		}
 	}
 
 	var coreMsgs []core.Message
@@ -218,10 +276,42 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 	}
 	c.Messages = coreMsgs
 
+	// Extract tools declarations
+	for _, t := range req.Tools {
+		if tMap, ok := t.(map[string]any); ok {
+			name, _ := tMap["name"].(string)
+			desc, _ := tMap["description"].(string)
+			params := tMap["input_schema"]
+			td := core.ToolDefinition{
+				Type: "function",
+				Function: map[string]any{
+					"name":        name,
+					"description": desc,
+					"parameters":  params,
+				},
+			}
+			c.Tools = append(c.Tools, td)
+		}
+	}
+	c.ToolChoice = req.ToolChoice
+
 	c.Parameters.Temperature = req.Temperature
 	c.Parameters.TopP = req.TopP
 	c.Parameters.MaxTokens = &req.MaxTokens
 	c.Parameters.Stop = req.StopSequences
+
+	if req.Stream {
+		if c.Meta == nil {
+			c.Meta = make(map[string]any)
+		}
+		c.Meta["stream"] = true
+	}
+	if req.Metadata != nil && req.Metadata.UserID != "" {
+		if c.Meta == nil {
+			c.Meta = make(map[string]any)
+		}
+		c.Meta["user_id"] = req.Metadata.UserID
+	}
 
 	return &c, nil
 }
@@ -253,10 +343,20 @@ func extractCoreParts(content any) ([]core.Part, error) {
 					p.Content = m["text"]
 				} else if p.Type == "image" {
 					p.Content = m["source"]
+				} else if p.Type == "thinking" {
+					p.Content = m["thinking"]
+					if sig, ok := m["signature"].(string); ok && sig != "" {
+						p.SetMeta("signature", sig)
+					}
 				} else {
 					p.Content = m[p.Type]
 				}
 				p.Meta = extractMeta(m["meta"])
+				if p.Type == "thinking" {
+					if sig, ok := m["signature"].(string); ok && sig != "" {
+						p.SetMeta("signature", sig)
+					}
+				}
 			} else {
 				p.Type = "text"
 				p.Content = fmt.Sprintf("%v", item)
