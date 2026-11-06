@@ -164,6 +164,20 @@ func TestAnthropicToolCalling(t *testing.T) {
 	if cBack.Messages[2].Role != core.RoleTool || cBack.Messages[2].ToolCallID != "toolu_123" {
 		t.Errorf("Tool message not extracted back: %+v", cBack.Messages[2])
 	}
+
+	// Re-export roundtrip: ensure assistant message has exactly 1 tool_use block with id and no ghost parts
+	reqAgain, err := anthropic.ToRequest(cBack, opts)
+	if err != nil {
+		t.Fatalf("ToRequest on roundtrip failed: %v", err)
+	}
+	asstPartsAgain, ok := reqAgain.Messages[1].Content.([]any)
+	if !ok || len(asstPartsAgain) != 1 {
+		t.Fatalf("Expected exactly 1 assistant content part on re-export, got %d: %+v", len(asstPartsAgain), reqAgain.Messages[1].Content)
+	}
+	toolUsePartAgain, ok := asstPartsAgain[0].(map[string]any)
+	if !ok || toolUsePartAgain["id"] != "toolu_123" || toolUsePartAgain["name"] != "search" {
+		t.Errorf("Unexpected tool_use part on re-export: %+v", asstPartsAgain[0])
+	}
 }
 
 func TestAnthropicThinkingBlocksRoundTrip(t *testing.T) {
