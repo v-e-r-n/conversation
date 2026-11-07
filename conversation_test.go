@@ -7,6 +7,7 @@ import (
 
 	"github.com/v-e-r-n/conversation"
 	"github.com/v-e-r-n/conversation/anthropic"
+	"github.com/v-e-r-n/conversation/core"
 	"github.com/v-e-r-n/conversation/gemini"
 	"github.com/v-e-r-n/conversation/openai"
 )
@@ -185,3 +186,151 @@ func TestValidationAndErrorPropagation(t *testing.T) {
 		t.Errorf("Expected unsupported provider error, got %v", err)
 	}
 }
+
+func TestOpenAIAnthropicCrossProviderRoundTrip(t *testing.T) {
+	temp := 0.7
+	maxTokens := 1024
+
+	origOpenAI := &openai.OpenAIRequest{
+		Model:       "gpt-4o",
+		Temperature: &temp,
+		MaxTokens:   &maxTokens,
+		Tools: []core.ToolDefinition{
+			{
+				Type: "function",
+				Function: map[string]any{
+					"name":        "search_docs",
+					"description": "Semantic search in documentation",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"query": map[string]any{"type": "string"},
+						},
+						"required": []any{"query"},
+					},
+				},
+			},
+		},
+		Messages: []openai.OpenAIMessage{
+			{
+				Role:    "system",
+				Content: "You are a specialized documentation search agent.",
+			},
+			{
+				Role:    "user",
+				Content: "How do I configure Anthropic provider?",
+			},
+			{
+				Role:    "assistant",
+				Content: "Searching documentation for Anthropic provider configuration...",
+				ToolCalls: []core.ToolCall{
+					{
+						ID:   "call_search_999",
+						Type: "function",
+						Function: core.ToolFunction{
+							Name:      "search_docs",
+							Arguments: `{"query":"Anthropic provider"}`,
+						},
+					},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_search_999",
+				Content:    `{"results":["Configure provider: anthropic in config.json"]}`,
+			},
+			{
+				Role:    "assistant",
+				Content: "You configure it by setting provider: anthropic in your config.json.",
+			},
+		},
+	}
+
+	opts := conversation.NewExportOptions()
+
+	// 1. Import OpenAI -> core.Conversation
+	conv1, err := conversation.FromOpenAI(origOpenAI)
+	if err != nil {
+		t.Fatalf("conversation.FromOpenAI failed: %v", err)
+	}
+
+	// 2. Export core.Conversation -> Anthropic request
+	anthropicReqRaw, err := conversation.Translate(conv1, conversation.ProviderAnthropic, opts)
+	if err != nil {
+		t.Fatalf("Translate to Anthropic failed: %v", err)
+	}
+	anthropicReq, ok := anthropicReqRaw.(*anthropic.AnthropicRequest)
+	if !ok {
+		t.Fatalf("expected *anthropic.AnthropicRequest, got %T", anthropicReqRaw)
+	}
+
+	// 3. Re-import Anthropic request -> core.Conversation
+	conv2, err := conversation.FromAnthropic(anthropicReq)
+	if err != nil {
+		t.Fatalf("conversation.FromAnthropic failed: %v", err)
+	}
+
+	// 4. Export core.Conversation -> OpenAI request
+	openAIRaw, err := conversation.Translate(conv2, conversation.ProviderOpenAI, opts)
+	if err != nil {
+		t.Fatalf("Translate back to OpenAI failed: %v", err)
+	}
+	finalOpenAI, ok := openAIRaw.(*openai.OpenAIRequest)
+	if !ok {
+		t.Fatalf("expected *openai.OpenAIRequest, got %T", openAIRaw)
+	}
+
+	// 5. Verify final OpenAI request lines up with original
+	if finalOpenAI.Model != origOpenAI.Model {
+		t.Errorf("Model mismatch: expected %q, got %q", origOpenAI.Model, finalOpenAI.Model)
+	}
+	if finalOpenAI.Temperature == nil || *finalOpenAI.Temperature != *origOpenAI.Temperature {
+		t.Errorf("Temperature mismatch: expected %v, got %v", *origOpenAI.Temperature, finalOpenAI.Temperature)
+	}
+	if finalOpenAI.MaxTokens == nil || *finalOpenAI.MaxTokens != *origOpenAI.MaxTokens {
+		t.Errorf("MaxTokens mismatch: expected %v, got %v", *origOpenAI.MaxTokens, finalOpenAI.MaxTokens)
+	}
+
+	if len(finalOpenAI.Tools) != len(origOpenAI.Tools) {
+		t.Fatalf("Tools count mismatch: expected %d, got %d", len(origOpenAI.Tools), len(finalOpenAI.Tools))
+	}
+	if finalOpenAI.Tools[0].Function["name"] != origOpenAI.Tools[0].Function["name"] {
+		t.Errorf("Tool name mismatch: expected %v, got %v", origOpenAI.Tools[0].Function["name"], finalOpenAI.Tools[0].Function["name"])
+	}
+
+	if len(finalOpenAI.Messages) != len(origOpenAI.Messages) {
+		t.Fatalf("Messages count mismatch: expected %d, got %d", len(origOpenAI.Messages), len(finalOpenAI.Messages))
+	}
+
+	for i := range origOpenAI.Messages {
+		orig := origOpenAI.Messages[i]
+		final := finalOpenAI.Messages[i]
+
+		if final.Role != orig.Role {
+			t.Errorf("Message[%d] Role mismatch: expected %q, got %q", i, orig.Role, final.Role)
+		}
+		if final.Content != orig.Content {
+			t.Errorf("Message[%d] Content mismatch: expected %v, got %v", i, orig.Content, final.Content)
+		}
+		if final.ToolCallID != orig.ToolCallID {
+			t.Errorf("Message[%d] ToolCallID mismatch: expected %q, got %q", i, orig.ToolCallID, final.ToolCallID)
+		}
+		if len(final.ToolCalls) != len(orig.ToolCalls) {
+			t.Fatalf("Message[%d] ToolCalls count mismatch: expected %d, got %d", i, len(orig.ToolCalls), len(final.ToolCalls))
+		}
+		for j := range orig.ToolCalls {
+			otc := orig.ToolCalls[j]
+			ftc := final.ToolCalls[j]
+			if ftc.ID != otc.ID {
+				t.Errorf("Message[%d].ToolCalls[%d] ID mismatch: expected %q, got %q", i, j, otc.ID, ftc.ID)
+			}
+			if ftc.Function.Name != otc.Function.Name {
+				t.Errorf("Message[%d].ToolCalls[%d] Name mismatch: expected %q, got %q", i, j, otc.Function.Name, ftc.Function.Name)
+			}
+			if ftc.Function.Arguments != otc.Function.Arguments {
+				t.Errorf("Message[%d].ToolCalls[%d] Arguments mismatch: expected %q, got %q", i, j, otc.Function.Arguments, ftc.Function.Arguments)
+			}
+		}
+	}
+}
+
