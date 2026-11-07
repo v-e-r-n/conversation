@@ -121,6 +121,9 @@ func ToRequest(c *core.Conversation, opts *core.ExportOptions) (*AnthropicReques
 						"source": rendered,
 					})
 					hasRichContent = true
+				case "tool_use", "tool_result":
+					// Skip any legacy or ghost tool parts in Parts; tool calls belong in ToolCalls and ToolCallID
+					continue
 				default:
 					renderedParts = append(renderedParts, map[string]any{
 						"type":    part.Type,
@@ -236,9 +239,11 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 		// Check if content contains tool_result or tool_use blocks
 		if arr, ok := msg.Content.([]any); ok {
 			var isToolResult bool
+			var nonToolBlocks []any
 			for _, item := range arr {
 				if itemMap, ok := item.(map[string]any); ok {
-					if itemMap["type"] == "tool_result" {
+					itemType, _ := itemMap["type"].(string)
+					if itemType == "tool_result" {
 						isToolResult = true
 						m.Role = core.RoleTool
 						if id, ok := itemMap["tool_use_id"].(string); ok {
@@ -248,7 +253,7 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 							m.Parts = []core.Part{{Type: "text", Content: cnt}}
 						}
 						break
-					} else if itemMap["type"] == "tool_use" {
+					} else if itemType == "tool_use" {
 						var tc core.ToolCall
 						tc.ID, _ = itemMap["id"].(string)
 						tc.Type = "function"
@@ -258,13 +263,24 @@ func FromRequest(req *AnthropicRequest) (*core.Conversation, error) {
 							tc.Function.Arguments = string(b)
 						}
 						m.ToolCalls = append(m.ToolCalls, tc)
+					} else {
+						nonToolBlocks = append(nonToolBlocks, item)
 					}
+				} else {
+					nonToolBlocks = append(nonToolBlocks, item)
 				}
 			}
 			if isToolResult {
 				coreMsgs = append(coreMsgs, m)
 				continue
 			}
+			parts, err := extractCoreParts(nonToolBlocks)
+			if err != nil {
+				return nil, err
+			}
+			m.Parts = parts
+			coreMsgs = append(coreMsgs, m)
+			continue
 		}
 
 		parts, err := extractCoreParts(msg.Content)
@@ -339,6 +355,10 @@ func extractCoreParts(content any) ([]core.Part, error) {
 			p := core.Part{}
 			if m, ok := item.(map[string]any); ok {
 				p.Type, _ = m["type"].(string)
+				if p.Type == "tool_use" || p.Type == "tool_result" {
+					// tool_use and tool_result blocks are handled at the message level and must not become ghost parts
+					continue
+				}
 				if p.Type == "text" {
 					p.Content = m["text"]
 				} else if p.Type == "image" {
